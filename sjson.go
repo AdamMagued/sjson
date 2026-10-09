@@ -488,8 +488,8 @@ func Delete(json, path string) (string, error) {
 }
 
 // DeleteOptions deletes a value from json for the specified path, with the given options.
-func DeleteOptions(json, path string, options *Options) (string, error) {
-	return SetOptions(json, path, dtype{}, options)
+func DeleteOptions(json, path string, opts *Options) (string, error) {
+	return SetOptions(json, path, dtype{}, opts)
 }
 
 // DeleteBytes deletes a value from json for the specified path.
@@ -498,8 +498,8 @@ func DeleteBytes(json []byte, path string) ([]byte, error) {
 }
 
 // DeleteBytesOptions deletes a value from json for the specified path, with the given options.
-func DeleteBytesOptions(json []byte, path string, options *Options) ([]byte, error) {
-	return SetBytesOptions(json, path, dtype{}, options)
+func DeleteBytesOptions(json []byte, path string, opts *Options) ([]byte, error) {
+	return SetBytesOptions(json, path, dtype{}, opts)
 }
 
 type stringHeader struct {
@@ -511,6 +511,55 @@ type sliceHeader struct {
 	data unsafe.Pointer
 	len  int
 	cap  int
+}
+
+func deleteInPlace(jbytes []byte, paths []pathResult) ([]byte, error) {
+	jstr := *(*string)(unsafe.Pointer(&jbytes))
+	var res gjson.Result
+	var found bool
+	if paths[0].part == "-1" && !paths[0].force {
+		res = gjson.Get(jstr, "#")
+		if res.Int() > 0 {
+			res = gjson.Get(jstr, strconv.FormatInt(int64(res.Int()-1), 10))
+			found = true
+		}
+	}
+	if !found {
+		res = gjson.Get(jstr, paths[0].gpart)
+	}
+	if res.Index <= 0 {
+		return nil, errNoChange
+	}
+	if len(paths) > 1 {
+		rawBytes := jbytes[res.Index : res.Index+len(res.Raw)]
+		nraw, err := deleteInPlace(rawBytes, paths[1:])
+		if err != nil {
+			return nil, err
+		}
+		suffixStart := res.Index + len(res.Raw)
+		copy(jbytes[res.Index+len(nraw):], jbytes[suffixStart:])
+		newLen := res.Index + len(nraw) + len(jbytes) - suffixStart
+		return jbytes[:newLen], nil
+	}
+	tailBuf, delNextComma := deleteTailItem(jbytes[:res.Index])
+	k := len(tailBuf)
+	var exidx int
+	if delNextComma {
+		i, j := res.Index+len(res.Raw), 0
+		for ; i < len(jbytes); i, j = i+1, j+1 {
+			if jbytes[i] <= ' ' {
+				continue
+			}
+			if jbytes[i] == ',' {
+				exidx = j + 1
+			}
+			break
+		}
+	}
+	suffixStart := res.Index + len(res.Raw) + exidx
+	copy(jbytes[k:], jbytes[suffixStart:])
+	newLen := k + len(jbytes) - suffixStart
+	return jbytes[:newLen], nil
 }
 
 func set(jstr, path, raw string,
@@ -557,7 +606,8 @@ func set(jstr, path, raw string,
 			return buf, nil
 		}
 	}
-	var paths []pathResult
+	var pathsArr [8]pathResult
+	paths := pathsArr[:0]
 	r, simple := parsePath(path)
 	if simple {
 		paths = append(paths, r)
@@ -575,6 +625,13 @@ func set(jstr, path, raw string,
 				&errorType{"cannot delete value from a complex path"}
 		}
 		return setComplexPath(jstr, path, raw, stringify)
+	}
+	if del && inplace {
+		jsonh := *(*stringHeader)(unsafe.Pointer(&jstr))
+		jsonbh := sliceHeader{
+			data: jsonh.data, len: jsonh.len, cap: jsonh.len}
+		jbytes := *(*[]byte)(unsafe.Pointer(&jsonbh))
+		return deleteInPlace(jbytes, paths)
 	}
 	njson, err := appendRawPaths(nil, jstr, paths, raw, stringify, del)
 	if err != nil {

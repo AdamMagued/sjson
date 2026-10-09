@@ -351,3 +351,172 @@ func TestIssue61(t *testing.T) {
 		t.Fail()
 	}
 }
+
+func TestDeleteOptions(t *testing.T) {
+	testCases := []struct {
+		json string
+		path string
+	}{
+		{`{"a":1,"b":2,"c":3}`, "a"},
+		{`{"a":1,"b":2,"c":3}`, "b"},
+		{`{"a":1,"b":2,"c":3}`, "c"},
+		{`{"only":1}`, "only"},
+		{`{"a":{"b":{"c":123}},"d":456}`, "a.b.c"},
+		{`{"a":{"b":{"c":123}},"d":456}`, "a.b"},
+		{`{"a":{"b":{"c":123}},"d":456}`, "a"},
+		{`[1,2,3]`, "0"},
+		{`[1,2,3]`, "1"},
+		{`[1,2,3]`, "2"},
+		{`[1,2,3]`, "-1"},
+		{`[42]`, "0"},
+		{`[42]`, "-1"},
+		{`{"arr":[10,20,30],"name":"test"}`, "arr.1"},
+		{`{"arr":[10,20,30],"name":"test"}`, "arr.-1"},
+		{`{"arr":[10,20,30],"name":"test"}`, "arr.0"},
+		{`{"users":[{"name":"alice"},{"name":"bob"}]}`, "users.0.name"},
+		{`{"users":[{"name":"alice"},{"name":"bob"}]}`, "users.1"},
+		{`{"users":[{"name":"alice"},{"name":"bob"}]}`, "users.-1"},
+		{`{"data":{"key1":"value1","key2.something":"value2"}}`, `data.key2\.something`},
+		{`{"1":"2","3":"4"}`, "3"},
+		{`{"nested":{"a":1,"b":2}}`, "nested.b"},
+		{`{"nested":{"a":1}}`, "nested.a"},
+		{`{"nested":{}}`, "nested.nonexistent"},
+		{`{"a": 1, "b": 2}`, "nonexistent"},
+		{`[1, 2, 3]`, "5"},
+	}
+
+	for _, tc := range testCases {
+		expected, err := Delete(tc.json, tc.path)
+		if err != nil {
+			t.Fatalf("Delete failed for %s path %s: %v", tc.json, tc.path, err)
+		}
+
+		// DeleteOptions string with nil opts
+		resStrNil, err := DeleteOptions(tc.json, tc.path, nil)
+		if err != nil || resStrNil != expected {
+			t.Fatalf("DeleteOptions (nil) mismatch for path %s: got %s, expected %s", tc.path, resStrNil, expected)
+		}
+
+		// DeleteOptions string with ReplaceInPlace: false
+		resStrNoInplace, err := DeleteOptions(tc.json, tc.path, &Options{ReplaceInPlace: false})
+		if err != nil || resStrNoInplace != expected {
+			t.Fatalf("DeleteOptions (no inplace) mismatch for path %s: got %s, expected %s", tc.path, resStrNoInplace, expected)
+		}
+
+		// DeleteOptions string with ReplaceInPlace: true (safe fallback for strings)
+		resStrInplace, err := DeleteOptions(tc.json, tc.path, &Options{ReplaceInPlace: true})
+		if err != nil || resStrInplace != expected {
+			t.Fatalf("DeleteOptions (inplace) mismatch for path %s: got %s, expected %s", tc.path, resStrInplace, expected)
+		}
+
+		// DeleteBytesOptions with nil opts
+		resBytesNil, err := DeleteBytesOptions([]byte(tc.json), tc.path, nil)
+		if err != nil || string(resBytesNil) != expected {
+			t.Fatalf("DeleteBytesOptions (nil) mismatch for path %s: got %s, expected %s", tc.path, string(resBytesNil), expected)
+		}
+
+		// DeleteBytesOptions with ReplaceInPlace: false
+		resBytesNoInplace, err := DeleteBytesOptions([]byte(tc.json), tc.path, &Options{ReplaceInPlace: false})
+		if err != nil || string(resBytesNoInplace) != expected {
+			t.Fatalf("DeleteBytesOptions (no inplace) mismatch for path %s: got %s, expected %s", tc.path, string(resBytesNoInplace), expected)
+		}
+
+		// DeleteBytesOptions with ReplaceInPlace: true
+		inputBytes := []byte(tc.json)
+		resBytesInplace, err := DeleteBytesOptions(inputBytes, tc.path, &Options{ReplaceInPlace: true})
+		if err != nil || string(resBytesInplace) != expected {
+			t.Fatalf("DeleteBytesOptions (inplace) mismatch for path %s: got %s, expected %s", tc.path, string(resBytesInplace), expected)
+		}
+
+		// DeleteBytesOptions with Optimistic: true and ReplaceInPlace: true
+		inputBytesOpt := []byte(tc.json)
+		resBytesOpt, err := DeleteBytesOptions(inputBytesOpt, tc.path, &Options{Optimistic: true, ReplaceInPlace: true})
+		if err != nil || string(resBytesOpt) != expected {
+			t.Fatalf("DeleteBytesOptions (optimistic+inplace) mismatch for path %s: got %s, expected %s", tc.path, string(resBytesOpt), expected)
+		}
+	}
+}
+
+func TestDeleteBytesOptionsInPlaceMutation(t *testing.T) {
+	jsonStr := `{"alpha":1,"beta":2,"gamma":3}`
+	input := []byte(jsonStr)
+	inputPtr := &input[0]
+
+	output, err := DeleteBytesOptions(input, "beta", &Options{ReplaceInPlace: true})
+	if err != nil {
+		t.Fatalf("DeleteBytesOptions returned error: %v", err)
+	}
+
+	expected := `{"alpha":1,"gamma":3}`
+	if string(output) != expected {
+		t.Fatalf("expected %s, got %s", expected, string(output))
+	}
+
+	outputPtr := &output[0]
+	if outputPtr != inputPtr {
+		t.Fatalf("expected in-place mutation on same memory address, got different pointers")
+	}
+
+	// Verify input slice was mutated
+	if string(input[:len(output)]) != expected {
+		t.Fatalf("expected underlying slice to be modified, got %s", string(input[:len(output)]))
+	}
+
+	// Verify ReplaceInPlace: false allocates a new slice
+	inputCopy := []byte(jsonStr)
+	copyPtr := &inputCopy[0]
+	outputCopy, err := DeleteBytesOptions(inputCopy, "beta", &Options{ReplaceInPlace: false})
+	if err != nil {
+		t.Fatalf("DeleteBytesOptions returned error: %v", err)
+	}
+	if &outputCopy[0] == copyPtr {
+		t.Fatalf("expected separate allocation when ReplaceInPlace is false")
+	}
+}
+
+func TestDeleteOptionsEdgeCases(t *testing.T) {
+	// Empty path
+	_, err := DeleteOptions(`{"a":1}`, "", &Options{ReplaceInPlace: true})
+	if err == nil || err.Error() != "path cannot be empty" {
+		t.Fatalf("expected 'path cannot be empty', got %v", err)
+	}
+	_, err = DeleteBytesOptions([]byte(`{"a":1}`), "", &Options{ReplaceInPlace: true})
+	if err == nil || err.Error() != "path cannot be empty" {
+		t.Fatalf("expected 'path cannot be empty', got %v", err)
+	}
+
+	// Complex path
+	_, err = DeleteOptions(`{"a":[1,2,3]}`, "a.#", &Options{ReplaceInPlace: true})
+	if err == nil || err.Error() != "cannot delete value from a complex path" {
+		t.Fatalf("expected 'cannot delete value from a complex path', got %v", err)
+	}
+	_, err = DeleteBytesOptions([]byte(`{"a":[1,2,3]}`), "a.*", &Options{ReplaceInPlace: true})
+	if err == nil || err.Error() != "cannot delete value from a complex path" {
+		t.Fatalf("expected 'cannot delete value from a complex path', got %v", err)
+	}
+
+	// Non-existent key with ReplaceInPlace returns original unchanged
+	orig := []byte(`{"a":1}`)
+	out, err := DeleteBytesOptions(orig, "missing", &Options{ReplaceInPlace: true})
+	if err != nil {
+		t.Fatalf("unexpected error for missing key: %v", err)
+	}
+	if string(out) != `{"a":1}` {
+		t.Fatalf("expected original content, got %s", string(out))
+	}
+}
+
+func BenchmarkDeleteBytesInPlace(b *testing.B) {
+	template := []byte(`{"name":{"first":"Janet","last":"Prichard"},"age":47,"active":true}`)
+	buf := make([]byte, len(template))
+	opts := &Options{ReplaceInPlace: true}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		copy(buf, template)
+		b.StartTimer()
+		_, _ = DeleteBytesOptions(buf, "age", opts)
+	}
+}
