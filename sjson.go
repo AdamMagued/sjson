@@ -427,19 +427,18 @@ func isOptimisticPath(path string) bool {
 //
 // A path is a series of keys separated by a dot.
 //
-//  {
-//    "name": {"first": "Tom", "last": "Anderson"},
-//    "age":37,
-//    "children": ["Sara","Alex","Jack"],
-//    "friends": [
-//      {"first": "James", "last": "Murphy"},
-//      {"first": "Roger", "last": "Craig"}
-//    ]
-//  }
-//  "name.last"          >> "Anderson"
-//  "age"                >> 37
-//  "children.1"         >> "Alex"
-//
+//	{
+//	  "name": {"first": "Tom", "last": "Anderson"},
+//	  "age":37,
+//	  "children": ["Sara","Alex","Jack"],
+//	  "friends": [
+//	    {"first": "James", "last": "Murphy"},
+//	    {"first": "Roger", "last": "Craig"}
+//	  ]
+//	}
+//	"name.last"          >> "Anderson"
+//	"age"                >> 37
+//	"children.1"         >> "Alex"
 func Set(json, path string, value interface{}) (string, error) {
 	return SetOptions(json, path, value, nil)
 }
@@ -744,4 +743,226 @@ func SetRawBytesOptions(json []byte, path string, value []byte,
 		return json, nil
 	}
 	return res, err
+}
+
+func isSafePathKeyChar(c byte, first bool) bool {
+	if first && c == ':' {
+		return false
+	}
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+		(c >= '0' && c <= '9') || c <= ' ' || c > '~' || c == '_' ||
+		c == '-' || c == ':'
+}
+
+// Escape returns an escaped path component, making it safe for use in a path.
+//
+// Special characters such as dots, wildcards (*, ?), colons, and backslashes
+// are escaped with backslashes.
+//
+//	json := `{"user":{"first.name":"Janet"}}`
+//	path := "user." + sjson.Escape("first.name")
+//	res, _ := sjson.Set(json, path, "Anderson")
+func Escape(comp string) string {
+	for i := 0; i < len(comp); i++ {
+		if !isSafePathKeyChar(comp[i], i == 0) {
+			ncomp := make([]byte, 0, len(comp)+4)
+			ncomp = append(ncomp, comp[:i]...)
+			for ; i < len(comp); i++ {
+				if !isSafePathKeyChar(comp[i], i == 0) {
+					ncomp = append(ncomp, '\\')
+				}
+				ncomp = append(ncomp, comp[i])
+			}
+			return string(ncomp)
+		}
+	}
+	return comp
+}
+
+// Unescape returns an unescaped path component, removing escape backslashes.
+//
+//	sjson.Unescape("first\\.name") // returns "first.name"
+func Unescape(comp string) string {
+	for i := 0; i < len(comp); i++ {
+		if comp[i] == '\\' {
+			ncomp := make([]byte, 0, len(comp))
+			ncomp = append(ncomp, comp[:i]...)
+			for ; i < len(comp); i++ {
+				if comp[i] == '\\' {
+					i++
+					if i < len(comp) {
+						ncomp = append(ncomp, comp[i])
+					}
+					continue
+				}
+				ncomp = append(ncomp, comp[i])
+			}
+			return string(ncomp)
+		}
+	}
+	return comp
+}
+
+func trimPathSegmentDots(part string) string {
+	for len(part) > 0 && part[0] == '.' {
+		part = part[1:]
+	}
+	for len(part) > 0 && part[len(part)-1] == '.' {
+		slashes := 0
+		for j := len(part) - 2; j >= 0 && part[j] == '\\'; j-- {
+			slashes++
+		}
+		if slashes%2 == 1 {
+			// Dot is escaped (\.), do not trim.
+			break
+		}
+		part = part[:len(part)-1]
+	}
+	return part
+}
+
+// JoinPath joins multiple path components into a single dot-separated path.
+// Empty components are omitted and unescaped boundary dots are trimmed.
+//
+//	sjson.JoinPath("users", sjson.Escape("first.name"), "0") // "users.first\\.name.0"
+func JoinPath(parts ...string) string {
+	var buf []byte
+	for _, part := range parts {
+		part = trimPathSegmentDots(part)
+		if len(part) == 0 {
+			continue
+		}
+		if len(buf) > 0 {
+			buf = append(buf, '.')
+		}
+		buf = append(buf, part...)
+	}
+	return string(buf)
+}
+
+// BuildPath escapes each raw component and joins them into a single dot-separated path.
+// Empty components are omitted.
+//
+//	sjson.BuildPath("users", "first.name", "0") // "users.first\\.name.0"
+func BuildPath(parts ...string) string {
+	var buf []byte
+	for _, part := range parts {
+		if len(part) == 0 {
+			continue
+		}
+		esc := Escape(part)
+		if len(buf) > 0 {
+			buf = append(buf, '.')
+		}
+		buf = append(buf, esc...)
+	}
+	return string(buf)
+}
+
+// ForceKey returns a path component forced to be treated as an object key
+// rather than an array index. This prefixes the escaped key with a colon (':')
+// in accordance with SJSON syntax.
+//
+//	sjson.JoinPath("users", sjson.ForceKey("2313"), "name") // "users.:2313.name"
+func ForceKey(key string) string {
+	return ":" + Escape(key)
+}
+
+// ForEachPath iterates over each segment of a JSON path expression,
+// calling fn for each segment. If fn returns false, iteration stops early.
+//
+// Escape sequences (\.), bracketed expressions ([...]), parenthesized queries
+// (#(...)), and quoted literals are preserved within their respective segment.
+func ForEachPath(path string, fn func(part string) bool) {
+	if len(path) == 0 {
+		return
+	}
+	start := 0
+	depthBracket := 0
+	depthParen := 0
+	depthBrace := 0
+	inQuote := false
+
+	for i := 0; i < len(path); i++ {
+		c := path[i]
+		if c == '\\' {
+			i++
+			continue
+		}
+		if c == '"' {
+			inQuote = !inQuote
+			continue
+		}
+		if inQuote {
+			continue
+		}
+		switch c {
+		case '[':
+			depthBracket++
+		case ']':
+			if depthBracket > 0 {
+				depthBracket--
+			}
+		case '(':
+			depthParen++
+		case ')':
+			if depthParen > 0 {
+				depthParen--
+			}
+		case '{':
+			depthBrace++
+		case '}':
+			if depthBrace > 0 {
+				depthBrace--
+			}
+		case '.':
+			if depthBracket == 0 && depthParen == 0 && depthBrace == 0 {
+				if !fn(path[start:i]) {
+					return
+				}
+				start = i + 1
+			}
+		}
+	}
+	fn(path[start:])
+}
+
+// TraversePath traverses the segments of a JSON path expression.
+// It is an alias for ForEachPath.
+func TraversePath(path string, fn func(part string) bool) {
+	ForEachPath(path, fn)
+}
+
+// SplitPath decomposes a JSON path expression into its individual path segments.
+// It respects escape sequences (\.), bracketed wildcards and expressions ([...]),
+// parenthesized queries (#(...)), and quoted literals.
+//
+//	sjson.SplitPath("users.first\\.name.0")            // ["users", "first\\.name", "0"]
+//	sjson.SplitPath("items.[*].id")                    // ["items", "[*]", "id"]
+//	sjson.SplitPath("friends.#(last=\"Murphy\").last") // ["friends", "#(last=\"Murphy\")", "last"]
+func SplitPath(path string) []string {
+	if len(path) == 0 {
+		return nil
+	}
+	var parts []string
+	ForEachPath(path, func(part string) bool {
+		parts = append(parts, part)
+		return true
+	})
+	return parts
+}
+
+// DecomposePath decomposes a JSON path expression into its individual path segments.
+// It is an alias for SplitPath.
+func DecomposePath(path string) []string {
+	return SplitPath(path)
+}
+
+// SplitPathUnescaped decomposes a JSON path expression into unescaped path segments.
+func SplitPathUnescaped(path string) []string {
+	parts := SplitPath(path)
+	for i := range parts {
+		parts[i] = Unescape(parts[i])
+	}
+	return parts
 }

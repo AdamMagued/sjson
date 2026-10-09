@@ -351,3 +351,364 @@ func TestIssue61(t *testing.T) {
 		t.Fail()
 	}
 }
+
+func TestEscape(t *testing.T) {
+	tests := []struct {
+		input  string
+		expect string
+	}{
+		{"", ""},
+		{"simple", "simple"},
+		{"first.name", "first\\.name"},
+		{"a.b.c", "a\\.b\\.c"},
+		{"user*name", "user\\*name"},
+		{"user?name", "user\\?name"},
+		{"order#1", "order\\#1"},
+		{"@context", "\\@context"},
+		{"a|b", "a\\|b"},
+		{"path\\to", "path\\\\to"},
+		{":id", "\\:id"},
+		{"foo:bar", "foo:bar"},
+		{"item[0]", "item\\[0\\]"},
+		{"key{1}", "key\\{1\\}"},
+		{"!#$%&'()*+,/:;<=>?@[\\]^`{|}~", "\\!\\#\\$\\%\\&\\'\\(\\)\\*\\+\\,\\/:\\;\\<\\=\\>\\?\\@\\[\\\\\\]\\^\\`\\{\\|\\}\\~"},
+		{"user name", "user name"},
+		{"user-name_1", "user-name_1"},
+		{"café", "café"},
+	}
+
+	for _, tc := range tests {
+		got := Escape(tc.input)
+		if got != tc.expect {
+			t.Fatalf("Escape(%q) = %q, expected %q", tc.input, got, tc.expect)
+		}
+	}
+}
+
+func TestUnescape(t *testing.T) {
+	tests := []struct {
+		input  string
+		expect string
+	}{
+		{"", ""},
+		{"simple", "simple"},
+		{"first\\.name", "first.name"},
+		{"a\\.b\\.c", "a.b.c"},
+		{"user\\*name", "user*name"},
+		{"user\\?name", "user?name"},
+		{"order\\#1", "order#1"},
+		{"\\@context", "@context"},
+		{"a\\|b", "a|b"},
+		{"path\\\\to", "path\\to"},
+		{"\\:id", ":id"},
+		{"foo:bar", "foo:bar"},
+		{"trailing\\", "trailing"},
+	}
+
+	for _, tc := range tests {
+		got := Unescape(tc.input)
+		if got != tc.expect {
+			t.Fatalf("Unescape(%q) = %q, expected %q", tc.input, got, tc.expect)
+		}
+	}
+
+	// Roundtrip property: Unescape(Escape(s)) == s
+	roundtrips := []string{
+		"",
+		"normal",
+		"first.name",
+		"a.b.c.d",
+		":colon",
+		"mid:colon",
+		"user*name?",
+		"order#42@test|pipe",
+		"path\\to\\dir",
+		"mixed.symbols*and?dots",
+	}
+	for _, s := range roundtrips {
+		escaped := Escape(s)
+		round := Unescape(escaped)
+		if round != s {
+			t.Fatalf("roundtrip mismatch for %q: escaped=%q, unescaped=%q", s, escaped, round)
+		}
+	}
+}
+
+func TestJoinPath(t *testing.T) {
+	tests := []struct {
+		parts  []string
+		expect string
+	}{
+		{nil, ""},
+		{[]string{}, ""},
+		{[]string{""}, ""},
+		{[]string{"", ""}, ""},
+		{[]string{"a"}, "a"},
+		{[]string{"a", "b", "c"}, "a.b.c"},
+		{[]string{"a", "", "b"}, "a.b"},
+		{[]string{"", "a", "b"}, "a.b"},
+		{[]string{"a.", ".b"}, "a.b"},
+		{[]string{"...a...", "...b..."}, "a.b"},
+		{[]string{"users", Escape("first.name"), "last"}, "users.first\\.name.last"},
+		{[]string{"users", "key\\.", "next"}, "users.key\\..next"},
+	}
+
+	for _, tc := range tests {
+		got := JoinPath(tc.parts...)
+		if got != tc.expect {
+			t.Fatalf("JoinPath(%v) = %q, expected %q", tc.parts, got, tc.expect)
+		}
+	}
+}
+
+func TestBuildPath(t *testing.T) {
+	tests := []struct {
+		parts  []string
+		expect string
+	}{
+		{nil, ""},
+		{[]string{}, ""},
+		{[]string{""}, ""},
+		{[]string{"users", "first.name", "last"}, "users.first\\.name.last"},
+		{[]string{"users", "user@domain.com", "profile"}, "users.user\\@domain\\.com.profile"},
+		{[]string{"items", "0", "name*"}, "items.0.name\\*"},
+		{[]string{"nested", "", "valid"}, "nested.valid"},
+	}
+
+	for _, tc := range tests {
+		got := BuildPath(tc.parts...)
+		if got != tc.expect {
+			t.Fatalf("BuildPath(%v) = %q, expected %q", tc.parts, got, tc.expect)
+		}
+	}
+}
+
+func TestForceKey(t *testing.T) {
+	if got := ForceKey("2313"); got != ":2313" {
+		t.Fatalf("expected ':2313', got %q", got)
+	}
+	if got := ForceKey("0"); got != ":0" {
+		t.Fatalf("expected ':0', got %q", got)
+	}
+	if got := ForceKey("key.with.dots"); got != ":key\\.with\\.dots" {
+		t.Fatalf("expected ':key\\.with\\.dots', got %q", got)
+	}
+
+	// Verify setting an object key rather than an array index
+	json, err := Set("{}", JoinPath("users", ForceKey("2313"), "name"), "Sara")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expect := `{"users":{"2313":{"name":"Sara"}}}`
+	if json != expect {
+		t.Fatalf("expected %q, got %q", expect, json)
+	}
+	if gjson.Get(json, "users.2313.name").String() != "Sara" {
+		t.Fatalf("gjson lookup mismatch")
+	}
+}
+
+func TestSplitPath(t *testing.T) {
+	tests := []struct {
+		path   string
+		expect []string
+	}{
+		{"", nil},
+		{"simple", []string{"simple"}},
+		{"users.name.first", []string{"users", "name", "first"}},
+		{"users.first\\.name.0", []string{"users", "first\\.name", "0"}},
+		{"fav\\.movie", []string{"fav\\.movie"}},
+		{"app\\.token.id", []string{"app\\.token", "id"}},
+		{"\\:1.this.4.\\.HI", []string{"\\:1", "this", "4", "\\.HI"}},
+		{"path\\\\.to.file", []string{"path\\\\", "to", "file"}},
+		{"a\\.b\\.c", []string{"a\\.b\\.c"}},
+		{"items.[*].id", []string{"items", "[*]", "id"}},
+		{"items.[0].id", []string{"items", "[0]", "id"}},
+		{"items.[?].name", []string{"items", "[?]", "name"}},
+		{"store.books.[*].title", []string{"store", "books", "[*]", "title"}},
+		{"items.[0,1].name", []string{"items", "[0,1]", "name"}},
+		{"users.[profile.age>30].id", []string{"users", "[profile.age>30]", "id"}},
+		{"data.#[name.first=\"John\"].age", []string{"data", "#[name.first=\"John\"]", "age"}},
+		{"friends.#(last=\"Murphy\").last", []string{"friends", "#(last=\"Murphy\")", "last"}},
+		{"friends.#(last=\"Murphy\")#.last", []string{"friends", "#(last=\"Murphy\")#", "last"}},
+		{"friends.#(first%\"D*\").last", []string{"friends", "#(first%\"D*\")", "last"}},
+		{"friends.#(name=\"Jane.Doe\").age", []string{"friends", "#(name=\"Jane.Doe\")", "age"}},
+		{"friends.#(nets.#(==\"fb\"))#.first", []string{"friends", "#(nets.#(==\"fb\"))#", "first"}},
+		{":0.name", []string{":0", "name"}},
+		{"children.@reverse.0", []string{"children", "@reverse", "0"}},
+		{"{a,b}.c", []string{"{a,b}", "c"}},
+	}
+
+	for _, tc := range tests {
+		got := SplitPath(tc.path)
+		if len(got) != len(tc.expect) {
+			t.Fatalf("SplitPath(%q) returned %d parts, expected %d (%v vs %v)",
+				tc.path, len(got), len(tc.expect), got, tc.expect)
+		}
+		for i := range got {
+			if got[i] != tc.expect[i] {
+				t.Fatalf("SplitPath(%q)[%d] = %q, expected %q", tc.path, i, got[i], tc.expect[i])
+			}
+		}
+
+		// Verify DecomposePath produces identical results
+		decomposed := DecomposePath(tc.path)
+		if len(decomposed) != len(tc.expect) {
+			t.Fatalf("DecomposePath(%q) mismatch", tc.path)
+		}
+	}
+}
+
+func TestSplitPathUnescaped(t *testing.T) {
+	tests := []struct {
+		path   string
+		expect []string
+	}{
+		{"", nil},
+		{"users.first\\.name.0", []string{"users", "first.name", "0"}},
+		{"accounts.user\\@domain\\.com.role", []string{"accounts", "user@domain.com", "role"}},
+		{"items.key\\[0\\].name", []string{"items", "key[0]", "name"}},
+	}
+
+	for _, tc := range tests {
+		got := SplitPathUnescaped(tc.path)
+		if len(got) != len(tc.expect) {
+			t.Fatalf("SplitPathUnescaped(%q) returned %d parts, expected %d",
+				tc.path, len(got), len(tc.expect))
+		}
+		for i := range got {
+			if got[i] != tc.expect[i] {
+				t.Fatalf("SplitPathUnescaped(%q)[%d] = %q, expected %q",
+					tc.path, i, got[i], tc.expect[i])
+			}
+		}
+	}
+
+	// Roundtrip: SplitPathUnescaped(BuildPath(parts...)) == parts
+	inputParts := []string{"catalog", "product.1", "detail[spec]", "version#2"}
+	built := BuildPath(inputParts...)
+	unescaped := SplitPathUnescaped(built)
+	if len(unescaped) != len(inputParts) {
+		t.Fatalf("roundtrip length mismatch")
+	}
+	for i := range unescaped {
+		if unescaped[i] != inputParts[i] {
+			t.Fatalf("roundtrip mismatch at %d: got %q, expected %q", i, unescaped[i], inputParts[i])
+		}
+	}
+}
+
+func TestForEachPathAndTraversePath(t *testing.T) {
+	path := "users.profile.emails.0"
+	var visited []string
+	ForEachPath(path, func(part string) bool {
+		visited = append(visited, part)
+		return true
+	})
+	expected := []string{"users", "profile", "emails", "0"}
+	if len(visited) != len(expected) {
+		t.Fatalf("ForEachPath length mismatch")
+	}
+	for i := range visited {
+		if visited[i] != expected[i] {
+			t.Fatalf("ForEachPath item mismatch at %d", i)
+		}
+	}
+
+	// Early termination test
+	var early []string
+	ForEachPath(path, func(part string) bool {
+		early = append(early, part)
+		return len(early) < 2
+	})
+	if len(early) != 2 || early[0] != "users" || early[1] != "profile" {
+		t.Fatalf("ForEachPath early termination failed: %v", early)
+	}
+
+	// TraversePath alias test
+	var traverseVisited []string
+	TraversePath(path, func(part string) bool {
+		traverseVisited = append(traverseVisited, part)
+		return true
+	})
+	if len(traverseVisited) != len(expected) {
+		t.Fatalf("TraversePath length mismatch")
+	}
+}
+
+func TestPathHelpersSetAndGet(t *testing.T) {
+	var json string
+	var err error
+
+	// 1. Dynamic path with dot-containing key
+	path1 := BuildPath("accounts", "user.1", "email")
+	json, err = Set(json, path1, "user1@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gjson.Get(json, path1).String() != "user1@example.com" {
+		t.Fatalf("expected email match")
+	}
+
+	// 2. Dynamic path with wildcard and special characters
+	path2 := BuildPath("accounts", "user*admin?", "role")
+	json, err = Set(json, path2, "superuser")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gjson.Get(json, path2).String() != "superuser" {
+		t.Fatalf("expected role match")
+	}
+
+	// 3. Dynamic path with array append using JoinPath
+	path3 := JoinPath("accounts", Escape("user.1"), "tags", "-1")
+	json, err = Set(json, path3, "active")
+	if err != nil {
+		t.Fatal(err)
+	}
+	json, err = Set(json, path3, "verified")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gjson.Get(json, JoinPath("accounts", Escape("user.1"), "tags", "0")).String() != "active" {
+		t.Fatalf("expected tag 0 match")
+	}
+	if gjson.Get(json, JoinPath("accounts", Escape("user.1"), "tags", "1")).String() != "verified" {
+		t.Fatalf("expected tag 1 match")
+	}
+
+	// 4. Dynamic path with Delete
+	deletePath := BuildPath("accounts", "user.1", "email")
+	json, err = Delete(json, deletePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gjson.Get(json, deletePath).Exists() {
+		t.Fatalf("expected email to be deleted")
+	}
+
+	// 5. Bytes version
+	rawBytes := []byte(`{}`)
+	rawBytes, err = SetBytes(rawBytes, BuildPath("meta", "@context"), "schema.org")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gjson.GetBytes(rawBytes, "meta.\\@context").String() != "schema.org" {
+		t.Fatalf("expected @context match")
+	}
+
+	// 6. Traverse path segments dynamically
+	complexPath := "config.servers.0.hostname"
+	segments := SplitPath(complexPath)
+	rebuilt := JoinPath(segments...)
+	if rebuilt != complexPath {
+		t.Fatalf("JoinPath(SplitPath) mismatch: %q vs %q", rebuilt, complexPath)
+	}
+	json, err = Set("{}", rebuilt, "prod-app-01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gjson.Get(json, complexPath).String() != "prod-app-01" {
+		t.Fatalf("expected hostname match")
+	}
+}
