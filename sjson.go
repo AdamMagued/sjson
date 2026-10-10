@@ -5,6 +5,7 @@ import (
 	jsongo "encoding/json"
 	"sort"
 	"strconv"
+	"unicode/utf8"
 	"unsafe"
 
 	"github.com/tidwall/gjson"
@@ -113,8 +114,15 @@ func parsePath(path string) (res pathResult, simple bool) {
 
 func mustMarshalString(s string) bool {
 	for i := 0; i < len(s); i++ {
-		if s[i] < ' ' || s[i] > 0x7f || s[i] == '"' || s[i] == '\\' {
+		if s[i] < ' ' || s[i] == '"' || s[i] == '\\' {
 			return true
+		}
+		if s[i] >= 0x80 {
+			r, sz := utf8.DecodeRuneInString(s[i:])
+			if (r == utf8.RuneError && sz == 1) || r == '\u2028' || r == '\u2029' {
+				return true
+			}
+			i += sz - 1
 		}
 	}
 	return false
@@ -544,7 +552,6 @@ func set(jstr, path, raw string,
 					}
 					return jbytes[:sz], nil
 				}
-				return []byte(jstr), nil
 			}
 			buf := make([]byte, 0, sz)
 			buf = append(buf, jstr[:res.Index]...)

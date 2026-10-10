@@ -351,3 +351,143 @@ func TestIssue61(t *testing.T) {
 		t.Fail()
 	}
 }
+
+func TestIssue85(t *testing.T) {
+	// Issue 85: cannot replace when processing special character "₫"
+	// Verify ReplaceInPlace and Optimistic with multi-byte UTF-8 characters.
+	tests := []struct {
+		name     string
+		input    string
+		path     string
+		value    interface{}
+		expected string
+	}{
+		{
+			name:     "vietnamese dong same length",
+			input:    `{"test":"149.000₫"}`,
+			path:     "test",
+			value:    "255.000₫",
+			expected: `{"test":"255.000₫"}`,
+		},
+		{
+			name:     "vietnamese dong shorter",
+			input:    `{"test":"149.000₫"}`,
+			path:     "test",
+			value:    "5₫",
+			expected: `{"test":"5₫"}`,
+		},
+		{
+			name:     "vietnamese dong longer",
+			input:    `{"test":"149.000₫"}`,
+			path:     "test",
+			value:    "149.000.000₫",
+			expected: `{"test":"149.000.000₫"}`,
+		},
+		{
+			name:     "euro symbol",
+			input:    `{"price":"100€"}`,
+			path:     "price",
+			value:    "200€",
+			expected: `{"price":"200€"}`,
+		},
+		{
+			name:     "cjk characters",
+			input:    `{"city":"东京"}`,
+			path:     "city",
+			value:    "北京",
+			expected: `{"city":"北京"}`,
+		},
+		{
+			name:     "arabic characters",
+			input:    `{"msg":"مرحبا"}`,
+			path:     "msg",
+			value:    "أهلا",
+			expected: `{"msg":"أهلا"}`,
+		},
+		{
+			name:     "emoji characters",
+			input:    `{"mood":"🎉"}`,
+			path:     "mood",
+			value:    "🚀",
+			expected: `{"mood":"🚀"}`,
+		},
+		{
+			name:     "bytes value",
+			input:    `{"test":"149.000₫"}`,
+			path:     "test",
+			value:    []byte("255.000₫"),
+			expected: `{"test":"255.000₫"}`,
+		},
+		{
+			name:     "escaped character fallback with inplace",
+			input:    `{"test":"hello world"}`,
+			path:     "test",
+			value:    "line\nbreak",
+			expected: "{\"test\":\"line\\nbreak\"}",
+		},
+		{
+			name:     "line separator fallback with inplace",
+			input:    `{"test":"hello world"}`,
+			path:     "test",
+			value:    "line\u2028break",
+			expected: "{\"test\":\"line\\u2028break\"}",
+		},
+		{
+			name:     "invalid utf8 fallback with inplace",
+			input:    `{"test":"hello world"}`,
+			path:     "test",
+			value:    "bad\xffutf8",
+			expected: "{\"test\":\"bad\ufffdutf8\"}",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := &Options{Optimistic: true, ReplaceInPlace: true}
+
+			// Test SetBytesOptions
+			inBytes := []byte(tc.input)
+			resBytes, err := SetBytesOptions(inBytes, tc.path, tc.value, opts)
+			if err != nil {
+				t.Fatalf("SetBytesOptions failed: %v", err)
+			}
+			if string(resBytes) != tc.expected {
+				t.Fatalf("SetBytesOptions expected %s, got %s", tc.expected, string(resBytes))
+			}
+
+			// Test SetOptions
+			resStr, err := SetOptions(tc.input, tc.path, tc.value, opts)
+			if err != nil {
+				t.Fatalf("SetOptions failed: %v", err)
+			}
+			if resStr != tc.expected {
+				t.Fatalf("SetOptions expected %s, got %s", tc.expected, resStr)
+			}
+		})
+	}
+}
+
+func TestIssue85ZeroAllocs(t *testing.T) {
+	opts := &Options{Optimistic: true, ReplaceInPlace: true}
+	orig := []byte(`{"price":"149.000₫"}`)
+	buf := make([]byte, len(orig))
+	allocs := testing.AllocsPerRun(100, func() {
+		copy(buf, orig)
+		_, _ = SetBytesOptions(buf, "price", "255.000₫", opts)
+	})
+	if allocs != 0 {
+		t.Fatalf("expected 0 allocs, got %v", allocs)
+	}
+}
+
+func BenchmarkSetBytesInPlaceMultibyte(b *testing.B) {
+	orig := []byte(`{"price":"149.000₫"}`)
+	buf := make([]byte, len(orig))
+	opts := &Options{Optimistic: true, ReplaceInPlace: true}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		copy(buf, orig)
+		_, _ = SetBytesOptions(buf, "price", "255.000₫", opts)
+	}
+}
