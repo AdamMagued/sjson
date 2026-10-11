@@ -351,3 +351,155 @@ func TestIssue61(t *testing.T) {
 		t.Fail()
 	}
 }
+
+func TestSplitPath(t *testing.T) {
+	tests := []struct {
+		path   string
+		expect []string
+	}{
+		{"", []string{""}},
+		{"simple", []string{"simple"}},
+		{"users.name.first", []string{"users", "name", "first"}},
+		{"users.first\\.name.0", []string{"users", "first\\.name", "0"}},
+		{"items.[*].id", []string{"items", "[*]", "id"}},
+		{"data.#[name.first=\"John\"].age", []string{"data", "#[name.first=\"John\"]", "age"}},
+		{"friends.#(last=\"Murphy\").last", []string{"friends", "#(last=\"Murphy\")", "last"}},
+		{"friends.#(last=\"Murphy\")#.last", []string{"friends", "#(last=\"Murphy\")#", "last"}},
+		{"a.b\\.c.d", []string{"a", "b\\.c", "d"}},
+	}
+
+	for _, tc := range tests {
+		got := SplitPath(tc.path)
+		if len(got) != len(tc.expect) {
+			t.Fatalf("SplitPath(%q) returned %d parts, want %d", tc.path, len(got), len(tc.expect))
+		}
+		for i := range got {
+			if got[i] != tc.expect[i] {
+				t.Fatalf("SplitPath(%q)[%d] = %q, want %q", tc.path, i, got[i], tc.expect[i])
+			}
+		}
+	}
+}
+
+func TestJoinPath(t *testing.T) {
+	if got := JoinPath(); got != "" {
+		t.Fatalf("JoinPath() = %q, want empty string", got)
+	}
+	if got := JoinPath("user"); got != "user" {
+		t.Fatalf("JoinPath(\"user\") = %q, want \"user\"", got)
+	}
+	if got := JoinPath("users", "profile", "name"); got != "users.profile.name" {
+		t.Fatalf("JoinPath mismatch: got %q", got)
+	}
+	parts := []string{"items", "0", "sku"}
+	if got := JoinPath(parts...); got != "items.0.sku" {
+		t.Fatalf("JoinPath(parts...) mismatch: got %q", got)
+	}
+}
+
+func TestIsComplexPath(t *testing.T) {
+	complexPaths := []string{
+		"users.#",
+		"items.*.id",
+		"list.[]",
+		"users.#(age>30).name",
+		"data.#[status=\"active\"].id",
+	}
+	for _, p := range complexPaths {
+		if !IsComplexPath(p) {
+			t.Fatalf("IsComplexPath(%q) = false, want true", p)
+		}
+	}
+
+	simplePaths := []string{
+		"users",
+		"users.0.name",
+		"a.b.c",
+		"config.host\\.domain",
+	}
+	for _, p := range simplePaths {
+		if IsComplexPath(p) {
+			t.Fatalf("IsComplexPath(%q) = true, want false", p)
+		}
+	}
+}
+
+func TestKeysAndKeysBytes(t *testing.T) {
+	json := `{"name":"John","age":30,"address":{"city":"Boston","state":"MA"},"tags":["a","b"]}`
+
+	// Top-level keys
+	keys := Keys(json, "")
+	expectedTop := []string{"name", "age", "address", "tags"}
+	if len(keys) != len(expectedTop) {
+		t.Fatalf("Keys(json, \"\") length = %d, want %d", len(keys), len(expectedTop))
+	}
+	for i, k := range keys {
+		if k != expectedTop[i] {
+			t.Fatalf("Keys(json, \"\")[%d] = %q, want %q", i, k, expectedTop[i])
+		}
+	}
+
+	// Nested object keys
+	subKeys := Keys(json, "address")
+	expectedSub := []string{"city", "state"}
+	if len(subKeys) != len(expectedSub) {
+		t.Fatalf("Keys(json, \"address\") length = %d, want %d", len(subKeys), len(expectedSub))
+	}
+	for i, k := range subKeys {
+		if k != expectedSub[i] {
+			t.Fatalf("Keys(json, \"address\")[%d] = %q, want %q", i, k, expectedSub[i])
+		}
+	}
+
+	// Non-object target returns nil
+	if k := Keys(json, "tags"); k != nil {
+		t.Fatalf("Keys on array expected nil, got %v", k)
+	}
+	if k := Keys(json, "age"); k != nil {
+		t.Fatalf("Keys on number expected nil, got %v", k)
+	}
+
+	// Missing path returns nil
+	if k := Keys(json, "nonexistent"); k != nil {
+		t.Fatalf("Keys on nonexistent path expected nil, got %v", k)
+	}
+
+	// KeysBytes parity
+	bytesKeys := KeysBytes([]byte(json), "address")
+	if len(bytesKeys) != len(expectedSub) {
+		t.Fatalf("KeysBytes length mismatch: %d vs %d", len(bytesKeys), len(expectedSub))
+	}
+	for i, k := range bytesKeys {
+		if k != expectedSub[i] {
+			t.Fatalf("KeysBytes[%d] = %q, want %q", i, k, expectedSub[i])
+		}
+	}
+}
+
+func TestNestedArrayUpdate(t *testing.T) {
+	json := `{"object1":{"object2":[{"nested_object1":{"nested_object2":[{"nested2_object1":1},{"nested2_object1":1}]}}]}}`
+	path := "object1.object2.#.nested_object1.nested_object2.#.nested2_object1"
+	out, err := Set(json, path, 2)
+	if err != nil {
+		t.Fatalf("Set failed: %v", err)
+	}
+	expected := `{"object1":{"object2":[{"nested_object1":{"nested_object2":[{"nested2_object1":2},{"nested2_object1":2}]}}]}}`
+	if out != expected {
+		t.Fatalf("Set output mismatch:\n got: %s\nwant: %s", out, expected)
+	}
+
+	// Verify with gjson
+	res := gjson.Get(out, path)
+	if !res.Exists() {
+		t.Fatalf("expected path to exist in output")
+	}
+	for _, val := range res.Array() {
+		for _, nestedVal := range val.Array() {
+			if nestedVal.Int() != 2 {
+				t.Fatalf("expected nested value 2, got %v", nestedVal)
+			}
+		}
+	}
+}
+
+

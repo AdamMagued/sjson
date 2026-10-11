@@ -3,7 +3,6 @@ package sjson
 
 import (
 	jsongo "encoding/json"
-	"sort"
 	"strconv"
 	"unsafe"
 
@@ -516,6 +515,15 @@ type sliceHeader struct {
 func set(jstr, path, raw string,
 	stringify, del, optimistic, inplace bool) ([]byte, error) {
 	if path == "" {
+		trimmed := trim(jstr)
+		if len(trimmed) == 0 || trimmed[0] == '{' {
+			paths := []pathResult{{part: "", gpart: ""}}
+			njson, err := appendRawPaths(nil, jstr, paths, raw, stringify, del)
+			if err != nil {
+				return []byte(jstr), err
+			}
+			return njson, nil
+		}
 		return []byte(jstr), &errorType{"path cannot be empty"}
 	}
 	if !del && optimistic && isOptimisticPath(path) {
@@ -583,54 +591,327 @@ func set(jstr, path, raw string,
 	return njson, nil
 }
 
-func setComplexPath(jstr, path, raw string, stringify bool) ([]byte, error) {
-	res := gjson.Get(jstr, path)
-	if !res.Exists() || !(res.Index != 0 || len(res.Indexes) != 0) {
-		return []byte(jstr), errNoChange
+// SplitPath splits a path into its traversal components, handling escaped dots
+// and complex query expressions.
+func SplitPath(path string) []string {
+	if len(path) == 0 {
+		return []string{""}
 	}
-	if res.Index != 0 {
-		njson := []byte(jstr[:res.Index])
-		if stringify {
-			njson = appendStringify(njson, raw)
-		} else {
-			njson = append(njson, raw...)
+	var parts []string
+	var start int
+	var parenDepth int
+	var inQuote bool
+	var escaped bool
+
+	for i := 0; i < len(path); i++ {
+		ch := path[i]
+		if escaped {
+			escaped = false
+			continue
 		}
-		njson = append(njson, jstr[res.Index+len(res.Raw):]...)
-		jstr = string(njson)
+		if ch == '\\' {
+			escaped = true
+			continue
+		}
+		if ch == '"' {
+			inQuote = !inQuote
+			continue
+		}
+		if !inQuote {
+			if ch == '(' || ch == '[' {
+				parenDepth++
+			} else if ch == ')' || ch == ']' {
+				if parenDepth > 0 {
+					parenDepth--
+				}
+			} else if ch == '.' && parenDepth == 0 {
+				parts = append(parts, path[start:i])
+				start = i + 1
+			}
+		}
 	}
-	if len(res.Indexes) > 0 {
-		type val struct {
-			index int
-			res   gjson.Result
+	parts = append(parts, path[start:])
+	return parts
+}
+
+// JoinPath joins traversal components into a dot-separated path string.
+func JoinPath(parts ...string) string {
+	if len(parts) == 0 {
+		return ""
+	}
+	var buf []byte
+	for i, part := range parts {
+		if i > 0 {
+			buf = append(buf, '.')
 		}
-		vals := make([]val, 0, len(res.Indexes))
-		res.ForEach(func(_, vres gjson.Result) bool {
-			vals = append(vals, val{res: vres})
+		buf = append(buf, part...)
+	}
+	return string(buf)
+}
+
+// IsComplexPath reports whether the path contains query, array traversal, or
+// wildcard selectors.
+func IsComplexPath(path string) bool {
+	parts := SplitPath(path)
+	for _, part := range parts {
+		if isComplexSelector(part) {
 			return true
-		})
-		if len(res.Indexes) != len(vals) {
+		}
+	}
+	return false
+}
+
+// Keys returns the object keys at the specified path.
+// If path is empty, it returns the top-level keys of the JSON object.
+// Returns nil if the target path does not exist or is not a JSON object.
+func Keys(json, path string) []string {
+	var res gjson.Result
+	if path == "" {
+		res = gjson.Parse(json)
+	} else {
+		res = gjson.Get(json, path)
+	}
+	if !res.Exists() || !res.IsObject() {
+		return nil
+	}
+	var keys []string
+	res.ForEach(func(key, _ gjson.Result) bool {
+		keys = append(keys, key.String())
+		return true
+	})
+	return keys
+}
+
+// KeysBytes returns the object keys at the specified path from a byte slice.
+// If path is empty, it returns the top-level keys of the JSON object.
+// Returns nil if the target path does not exist or is not a JSON object.
+func KeysBytes(json []byte, path string) []string {
+	jstr := *(*string)(unsafe.Pointer(&json))
+	return Keys(jstr, path)
+}
+
+func isComplexSelector(part string) bool {
+	if part == "#" || part == "*" || part == "[]" {
+		return true
+	}
+	if len(part) >= 3 && part[0] == '#' && (part[1] == '(' || part[1] == '[') {
+		return true
+	}
+	return false
+}
+
+func inBounds(length, start, end int) bool {
+	return start >= 0 && end >= start && end <= length
+}
+
+func safeReplace(s string, start, end int, replacement string) (string, bool) {
+	if !inBounds(len(s), start, end) {
+		return s, false
+	}
+	var buf []byte
+	buf = append(buf, s[:start]...)
+	buf = append(buf, replacement...)
+	buf = append(buf, s[end:]...)
+	return string(buf), true
+}
+
+func unescapePart(s string) string {
+	var buf []byte
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			i++
+			buf = append(buf, s[i])
+			continue
+		}
+		buf = append(buf, s[i])
+	}
+	return string(buf)
+}
+
+func mutatePath(jstr string, comps []string, raw string, stringify, del bool) (string, error) {
+	if len(comps) == 0 {
+		return jstr, nil
+	}
+	cidx := -1
+	for i, comp := range comps {
+		if isComplexSelector(comp) {
+			cidx = i
+			break
+		}
+	}
+	if cidx == -1 {
+		paths := make([]pathResult, len(comps))
+		for i, comp := range comps {
+			part := comp
+			force := false
+			if len(part) > 0 && part[0] == ':' {
+				force = true
+				part = part[1:]
+			}
+			paths[i] = pathResult{
+				part:  unescapePart(part),
+				gpart: comp,
+				force: force,
+			}
+		}
+		res, err := appendRawPaths(nil, jstr, paths, raw, stringify, del)
+		if err != nil {
+			return jstr, err
+		}
+		return string(res), nil
+	}
+	if cidx > 0 {
+		prefix := JoinPath(comps[:cidx]...)
+		target := gjson.Get(jstr, prefix)
+		if !target.Exists() {
+			return jstr, errNoChange
+		}
+		if !inBounds(len(jstr), target.Index, target.Index+len(target.Raw)) ||
+			jstr[target.Index:target.Index+len(target.Raw)] != target.Raw {
+			return jstr, errNoChange
+		}
+		newTarget, err := mutateComplex(target.Raw, comps[cidx:], raw, stringify, del)
+		if err != nil {
+			return jstr, err
+		}
+		safeRep, ok := safeReplace(jstr, target.Index, target.Index+len(target.Raw), newTarget)
+		if !ok {
+			return jstr, errNoChange
+		}
+		return safeRep, nil
+	}
+	return mutateComplex(jstr, comps, raw, stringify, del)
+}
+
+func mutateComplex(arrJSON string, comps []string, raw string, stringify, del bool) (string, error) {
+	trimmed := trim(arrJSON)
+	if len(trimmed) < 2 || trimmed[0] != '[' || trimmed[len(trimmed)-1] != ']' {
+		return arrJSON, &errorType{"complex path selector requires JSON array"}
+	}
+	sel := comps[0]
+	suffix := comps[1:]
+
+	arrRes := gjson.Parse(arrJSON)
+	if !arrRes.Exists() || !arrRes.IsArray() {
+		return arrJSON, &errorType{"invalid JSON array"}
+	}
+	elements := arrRes.Array()
+
+	if sel == "#" || sel == "*" || sel == "[]" {
+		newElements := make([]string, 0, len(elements))
+		for _, el := range elements {
+			if len(suffix) == 0 {
+				if del {
+					continue
+				}
+				if stringify {
+					newElements = append(newElements, string(appendStringify(nil, raw)))
+				} else {
+					newElements = append(newElements, raw)
+				}
+			} else {
+				newEl, err := mutatePath(el.Raw, suffix, raw, stringify, del)
+				if err != nil {
+					return arrJSON, err
+				}
+				newElements = append(newElements, newEl)
+			}
+		}
+		var buf []byte
+		buf = append(buf, '[')
+		for i, el := range newElements {
+			if i > 0 {
+				buf = append(buf, ',')
+			}
+			buf = append(buf, el...)
+		}
+		buf = append(buf, ']')
+		return string(buf), nil
+	}
+
+	if len(sel) >= 3 && sel[0] == '#' && (sel[1] == '(' || sel[1] == '[') {
+		isAll := sel[len(sel)-1] == '#'
+		if isAll {
+			query := sel[:len(sel)-1]
+			newElements := make([]string, len(elements))
+			for i, el := range elements {
+				testArr := "[" + el.Raw + "]"
+				match := gjson.Get(testArr, query)
+				if match.Exists() {
+					if len(suffix) == 0 {
+						if del {
+							continue
+						}
+						if stringify {
+							newElements[i] = string(appendStringify(nil, raw))
+						} else {
+							newElements[i] = raw
+						}
+					} else {
+						newEl, err := mutatePath(el.Raw, suffix, raw, stringify, del)
+						if err != nil {
+							return arrJSON, err
+						}
+						newElements[i] = newEl
+					}
+				} else {
+					newElements[i] = el.Raw
+				}
+			}
+			var buf []byte
+			buf = append(buf, '[')
+			for i, el := range newElements {
+				if i > 0 {
+					buf = append(buf, ',')
+				}
+				buf = append(buf, el...)
+			}
+			buf = append(buf, ']')
+			return string(buf), nil
+		}
+
+		match := gjson.Get(arrJSON, sel)
+		if !match.Exists() {
+			return arrJSON, errNoChange
+		}
+		if !inBounds(len(arrJSON), match.Index, match.Index+len(match.Raw)) ||
+			arrJSON[match.Index:match.Index+len(match.Raw)] != match.Raw {
+			return arrJSON, errNoChange
+		}
+		var newEl string
+		if len(suffix) == 0 {
+			if stringify {
+				newEl = string(appendStringify(nil, raw))
+			} else {
+				newEl = raw
+			}
+		} else {
+			var err error
+			newEl, err = mutatePath(match.Raw, suffix, raw, stringify, del)
+			if err != nil {
+				return arrJSON, err
+			}
+		}
+		safeRep, ok := safeReplace(arrJSON, match.Index, match.Index+len(match.Raw), newEl)
+		if !ok {
+			return arrJSON, errNoChange
+		}
+		return safeRep, nil
+	}
+
+	return arrJSON, &errorType{"unsupported complex path selector: " + sel}
+}
+
+func setComplexPath(jstr, path, raw string, stringify bool) ([]byte, error) {
+	comps := SplitPath(path)
+	out, err := mutatePath(jstr, comps, raw, stringify, false)
+	if err != nil {
+		if err == errNoChange {
 			return []byte(jstr), errNoChange
 		}
-		for i := 0; i < len(res.Indexes); i++ {
-			vals[i].index = res.Indexes[i]
-		}
-		sort.SliceStable(vals, func(i, j int) bool {
-			return vals[i].index > vals[j].index
-		})
-		for _, val := range vals {
-			vres := val.res
-			index := val.index
-			njson := []byte(jstr[:index])
-			if stringify {
-				njson = appendStringify(njson, raw)
-			} else {
-				njson = append(njson, raw...)
-			}
-			njson = append(njson, jstr[index+len(vres.Raw):]...)
-			jstr = string(njson)
-		}
+		return []byte(jstr), err
 	}
-	return []byte(jstr), nil
+	return []byte(out), nil
 }
 
 // SetOptions sets a json value for the specified path with options.
