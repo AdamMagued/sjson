@@ -437,7 +437,7 @@ func TestIssue85(t *testing.T) {
 			input:    `{"test":"hello world"}`,
 			path:     "test",
 			value:    "bad\xffutf8",
-			expected: "{\"test\":\"bad\ufffdutf8\"}",
+			expected: "{\"test\":\"bad\\ufffdutf8\"}",
 		},
 	}
 
@@ -491,3 +491,4 @@ func BenchmarkSetBytesInPlaceMultibyte(b *testing.B) {
 		_, _ = SetBytesOptions(buf, "price", "255.000₫", opts)
 	}
 }
+
