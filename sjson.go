@@ -544,7 +544,6 @@ func set(jstr, path, raw string,
 					}
 					return jbytes[:sz], nil
 				}
-				return []byte(jstr), nil
 			}
 			buf := make([]byte, 0, sz)
 			buf = append(buf, jstr[:res.Index]...)

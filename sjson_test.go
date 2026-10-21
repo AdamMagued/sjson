@@ -351,3 +351,145 @@ func TestIssue61(t *testing.T) {
 		t.Fail()
 	}
 }
+
+func TestReplaceInPlaceWithEscapedCharacters(t *testing.T) {
+	opts := &Options{Optimistic: true, ReplaceInPlace: true}
+
+	// Issue #85 regression case with SetOptions
+	{
+		res, err := SetOptions(`{"test":"149.000₫"}`, "test", "255.000₫", opts)
+		if err != nil {
+			t.Fatalf("SetOptions failed: %v", err)
+		}
+		if got := gjson.Get(res, "test").String(); got != "255.000₫" {
+			t.Fatalf("expected 255.000₫, got %s", got)
+		}
+		if res != `{"test":"255.000₫"}` {
+			t.Fatalf("expected {\"test\":\"255.000₫\"}, got %s", res)
+		}
+	}
+
+	// Issue #85 regression case with SetBytesOptions
+	{
+		input := []byte(`{"test":"149.000₫"}`)
+		res, err := SetBytesOptions(input, "test", "255.000₫", opts)
+		if err != nil {
+			t.Fatalf("SetBytesOptions failed: %v", err)
+		}
+		if got := gjson.GetBytes(res, "test").String(); got != "255.000₫" {
+			t.Fatalf("expected 255.000₫, got %s", got)
+		}
+		if string(res) != `{"test":"255.000₫"}` {
+			t.Fatalf("expected {\"test\":\"255.000₫\"}, got %s", string(res))
+		}
+	}
+
+	tests := []struct {
+		name     string
+		input    string
+		path     string
+		value    interface{}
+		expected string
+	}{
+		{
+			name:     "newline character",
+			input:    `{"test":"hello world"}`,
+			path:     "test",
+			value:    "line\nbreak",
+			expected: "line\nbreak",
+		},
+		{
+			name:     "tab character",
+			input:    `{"test":"hello world"}`,
+			path:     "test",
+			value:    "tab\tseparated",
+			expected: "tab\tseparated",
+		},
+		{
+			name:     "quote character",
+			input:    `{"test":"hello world"}`,
+			path:     "test",
+			value:    `quoted "value"`,
+			expected: `quoted "value"`,
+		},
+		{
+			name:     "backslash character",
+			input:    `{"test":"hello world"}`,
+			path:     "test",
+			value:    `path\to\file`,
+			expected: `path\to\file`,
+		},
+		{
+			name:     "vietnamese dong same length",
+			input:    `{"test":"149.000₫"}`,
+			path:     "test",
+			value:    "255.000₫",
+			expected: "255.000₫",
+		},
+		{
+			name:     "vietnamese dong shorter length",
+			input:    `{"test":"149.000₫"}`,
+			path:     "test",
+			value:    "5₫",
+			expected: "5₫",
+		},
+		{
+			name:     "vietnamese dong longer length",
+			input:    `{"test":"149.000₫"}`,
+			path:     "test",
+			value:    "149.000.000₫",
+			expected: "149.000.000₫",
+		},
+		{
+			name:     "euro currency symbol",
+			input:    `{"price":"100000000"}`,
+			path:     "price",
+			value:    "200€",
+			expected: "200€",
+		},
+		{
+			name:     "cjk multi-byte characters",
+			input:    `{"city":"somewhere"}`,
+			path:     "city",
+			value:    "北京",
+			expected: "北京",
+		},
+		{
+			name:     "arabic multi-byte characters",
+			input:    `{"msg":"placeholder"}`,
+			path:     "msg",
+			value:    "مرحبا",
+			expected: "مرحبا",
+		},
+		{
+			name:     "bytes value with multi-byte characters",
+			input:    `{"test":"149.000₫"}`,
+			path:     "test",
+			value:    []byte("255.000₫"),
+			expected: "255.000₫",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// SetBytesOptions test
+			inBytes := []byte(tc.input)
+			resBytes, err := SetBytesOptions(inBytes, tc.path, tc.value, opts)
+			if err != nil {
+				t.Fatalf("SetBytesOptions failed: %v", err)
+			}
+			if got := gjson.GetBytes(resBytes, tc.path).String(); got != tc.expected {
+				t.Fatalf("SetBytesOptions expected %s, got %s", tc.expected, got)
+			}
+
+			// SetOptions test
+			resStr, err := SetOptions(tc.input, tc.path, tc.value, opts)
+			if err != nil {
+				t.Fatalf("SetOptions failed: %v", err)
+			}
+			if got := gjson.Get(resStr, tc.path).String(); got != tc.expected {
+				t.Fatalf("SetOptions expected %s, got %s", tc.expected, got)
+			}
+		})
+	}
+}
